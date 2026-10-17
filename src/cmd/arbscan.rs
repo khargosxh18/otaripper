@@ -392,6 +392,8 @@ pub fn run(no_json: bool, path: &Path) -> anyhow::Result<()> {
                 sanity: false,
                 stats: false,
                 no_open: true,
+                direct_fd: Vec::new(),
+                readback: false,
                 positional_payload: Some(path.to_path_buf()),
                 quiet: true,
             };

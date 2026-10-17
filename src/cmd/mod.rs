@@ -1,4 +1,5 @@
 pub mod arbscan;
+mod direct;
 pub mod extractor;
 pub mod metadata;
 pub mod simd;
@@ -111,6 +112,24 @@ pub struct Cmd {
         help = "Don't automatically open the extracted folder after completion."
     )]
     pub(super) no_open: bool,
+
+    /// Write straight into already-opened block devices (recovery integration)
+    #[clap(
+        long,
+        value_name = "FD",
+        requires = "partitions",
+        conflicts_with_all = ["list", "output_dir", "no_verify"],
+        help = "Write each -p partition into an inherited, already-opened block-device descriptor (one --direct-fd per partition, same order). No files are created; progress is printed as \"<partition>:<percent>\"."
+    )]
+    pub(super) direct_fd: Vec<i32>,
+
+    /// With --direct-fd: verify by re-reading from the device instead of from the page cache
+    #[clap(
+        long,
+        requires = "direct_fd",
+        help = "With --direct-fd: flush and drop the device cache, then verify SHA-256 by re-reading the written data from the device (slower, checks what actually reached storage)."
+    )]
+    pub(super) readback: bool,
 
     /// Positional argument for the payload file
     #[clap(value_hint = ValueHint::FilePath)]

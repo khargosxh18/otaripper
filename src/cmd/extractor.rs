@@ -243,7 +243,12 @@ impl<'a> Extractor<'a> {
 
         let payload_path_str = payload_path.to_str().context("Path is not valid UTF-8")?;
 
-        let metadata = crate::cmd::metadata::fetch_metadata(payload_path_str);
+        // the recovery/direct path has no use for the firmware banner
+        let metadata = if self.cmd.direct_fd.is_empty() {
+            crate::cmd::metadata::fetch_metadata(payload_path_str)
+        } else {
+            None
+        };
         if let Some(ref meta) = metadata
             && !self.cmd.quiet
         {
@@ -411,6 +416,18 @@ impl<'a> Extractor<'a> {
                 factory = bold_yellow.apply_to("\"Full OTA\""),
                 sideload = bold_yellow.apply_to("\"Recovery Flashable\"")
             );
+        }
+
+        // 3b. DIRECT MODE: stream into inherited block-device descriptors.
+        if !self.cmd.direct_fd.is_empty() {
+            ensure!(
+                matches!(
+                    &payload_source,
+                    PayloadSource::Mapped(_) | PayloadSource::MappedOffset(..)
+                ),
+                "direct mode requires payload.bin to be stored uncompressed inside the zip"
+            );
+            return super::direct::run(self.cmd, payload, &manifest, block_size);
         }
 
         // 4. Continue with extraction setup...
