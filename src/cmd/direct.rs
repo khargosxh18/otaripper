@@ -469,7 +469,7 @@ fn write_targets(
     }
 }
 
-fn expected_hash(t: &Target<'_>) -> Result<&[u8]> {
+fn expected_hash<'a>(t: &'a Target<'_>) -> Result<&'a [u8]> {
     t.part
         .new_partition_info
         .as_ref()

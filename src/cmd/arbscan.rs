@@ -431,6 +431,7 @@ pub fn run(no_json: bool, path: &Path) -> anyhow::Result<()> {
             let mut best_priority = usize::MAX;
 
             for name in archive.file_names() {
+                let name = name?;
                 let name_lower = name.to_lowercase();
 
                 let matches_candidate = |suffix: &str| -> bool {
