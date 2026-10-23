@@ -71,6 +71,8 @@ struct Target<'a> {
     part: &'a PartitionUpdate,
     file: File,
     size: u64,
+    /// verify by re-reading from the device (cache dropped) instead of from the page cache
+    readback: bool,
 }
 
 pub(super) fn run(
@@ -114,7 +116,12 @@ pub(super) fn run(
         let (file, device) =
             open_target(fd, size).with_context(|| format!("target of '{name}'"))?;
         ensure!(devices.insert(device), "'{name}' aliases another target device");
-        targets.push(Target { name: name.as_str(), part, file, size });
+        let readback = cmd.readback || cmd.readback_for.iter().any(|n| n == name);
+        targets.push(Target { name: name.as_str(), part, file, size, readback });
+    }
+    // a name that matches no -p partition is a caller bug, not something to ignore
+    for n in &cmd.readback_for {
+        ensure!(names.contains(n.as_str()), "--readback-for names '{n}', which is not a -p partition");
     }
 
     let workers = worker_count(cmd.threads);
@@ -126,7 +133,7 @@ pub(super) fn run(
     );
     let total: u64 = targets.iter().map(|t| t.size).sum();
     let started = Instant::now();
-    write_targets(&targets, block, data, workers, cmd.readback, STREAM_HASH_MIN)?;
+    write_targets(&targets, block, data, workers, STREAM_HASH_MIN)?;
     let secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
     eprintln!(
         "direct: {} partition(s), {} in {:.2}s ({:.2} GB/s), {} workers{}",
@@ -135,7 +142,11 @@ pub(super) fn run(
         secs,
         total as f64 / secs / 1e9,
         workers,
-        if cmd.readback { ", device readback" } else { "" }
+        match targets.iter().filter(|t| t.readback).count() {
+            0 => String::new(),
+            n if n == targets.len() => ", device readback".to_string(),
+            n => format!(", device readback for {n}"),
+        }
     );
     Ok(())
 }
@@ -282,7 +293,6 @@ fn write_targets(
     block: u64,
     data: &[u8],
     workers: usize,
-    readback: bool,
     stream_hash_min: u64,
 ) -> Result<()> {
     // Largest partition first, so the biggest image is under way (and hashed
@@ -304,7 +314,7 @@ fn write_targets(
     // readback replaces the hash anyway
     let streaming: Vec<bool> = targets
         .iter()
-        .map(|t| !readback && t.size >= stream_hash_min)
+        .map(|t| !t.readback && t.size >= stream_hash_min)
         .collect();
     let op_done: Vec<Vec<AtomicBool>> = targets
         .iter()
@@ -368,8 +378,8 @@ fn write_targets(
             if remaining[i].fetch_sub(1, Ordering::AcqRel) == 1 && !streaming[i] {
                 // last operation of a small partition: hash it (unless a
                 // device readback follows) and flush it while the others go on
-                match finish_partition(t, readback) {
-                    Ok(()) if !readback => phase[i].store(VERIFIED, Ordering::Release),
+                match finish_partition(t) {
+                    Ok(()) if !t.readback => phase[i].store(VERIFIED, Ordering::Release),
                     Ok(()) => {}
                     Err(e) => {
                         fail(i, e);
@@ -391,13 +401,19 @@ fn write_targets(
         Err(e) => fail(i, e),
     };
 
+    // partitions verified from the device after all writes are done
+    let readback_order: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&i| targets[i].readback)
+        .collect();
     let next_verify = AtomicUsize::new(0);
     let readback_worker = || {
         loop {
             if cancelled.load(Ordering::Acquire) {
                 return;
             }
-            let Some(&i) = order.get(next_verify.fetch_add(1, Ordering::Relaxed)) else {
+            let Some(&i) = readback_order.get(next_verify.fetch_add(1, Ordering::Relaxed)) else {
                 return;
             };
             let t = &targets[i];
@@ -429,8 +445,8 @@ fn write_targets(
                 worker_panicked();
             }
         }
-        if readback && !cancelled.load(Ordering::Acquire) {
-            let verifiers: Vec<_> = (0..workers.min(targets.len()))
+        if !readback_order.is_empty() && !cancelled.load(Ordering::Acquire) {
+            let verifiers: Vec<_> = (0..workers.min(readback_order.len()))
                 .map(|_| s.spawn(&readback_worker))
                 .collect();
             for v in verifiers {
@@ -509,8 +525,8 @@ fn hash_as_written(
     Ok(true)
 }
 
-fn finish_partition(t: &Target<'_>, readback: bool) -> Result<()> {
-    if !readback {
+fn finish_partition(t: &Target<'_>) -> Result<()> {
+    if !t.readback {
         // the data was just written, so this is served from the page cache
         check_hash(t)?;
     }
@@ -727,7 +743,7 @@ mod tests {
 
     fn target<'a>(p: &'a PartitionUpdate, file: File) -> Target<'a> {
         let size = p.new_partition_info.as_ref().unwrap().size.unwrap();
-        Target { name: "boot", part: p, file, size }
+        Target { name: "boot", part: p, file, size, readback: false }
     }
 
     fn contents(file: &File, len: usize) -> Vec<u8> {
@@ -743,7 +759,7 @@ mod tests {
         let p = part(vec![op(0, 0, 1, &data), op(6, 1, 1, &[]), op(7, 2, 1, &[])], &image);
         let file = tempfile::tempfile().unwrap();
         file.write_all_at(&vec![0x55; 2048], 0).unwrap();
-        write_targets(&[target(&p, file.try_clone().unwrap())], BLOCK, &data, 4, false, u64::MAX).unwrap();
+        write_targets(&[target(&p, file.try_clone().unwrap())], BLOCK, &data, 4, u64::MAX).unwrap();
         let got = contents(&file, 2048);
         assert_eq!(&got[..1536], &image[..]);
         assert_eq!(&got[1536..], &vec![0x55; 512][..]);
@@ -773,7 +789,7 @@ mod tests {
             let p = part(vec![o], &image);
             let file = tempfile::tempfile().unwrap();
             file.set_len(1024).unwrap();
-            write_targets(&[target(&p, file.try_clone().unwrap())], BLOCK, &input, 2, false, u64::MAX).unwrap();
+            write_targets(&[target(&p, file.try_clone().unwrap())], BLOCK, &input, 2, u64::MAX).unwrap();
             assert_eq!(contents(&file, 1024), image, "codec {kind}");
         }
     }
@@ -788,7 +804,7 @@ mod tests {
         let p = part(vec![op(8, 0, 2, &input)], &image);
         let file = tempfile::tempfile().unwrap();
         file.write_all_at(&vec![0x55; 1024], 0).unwrap();
-        write_targets(&[target(&p, file.try_clone().unwrap())], BLOCK, &input, 1, false, u64::MAX).unwrap();
+        write_targets(&[target(&p, file.try_clone().unwrap())], BLOCK, &input, 1, u64::MAX).unwrap();
         assert_eq!(contents(&file, 1024), image);
     }
 
@@ -800,7 +816,7 @@ mod tests {
         let p = part(vec![o], &data);
         let file = tempfile::tempfile().unwrap();
         file.write_all_at(&vec![0x55; 512], 0).unwrap();
-        assert!(write_targets(&[target(&p, file.try_clone().unwrap())], BLOCK, &data, 1, false, u64::MAX).is_err());
+        assert!(write_targets(&[target(&p, file.try_clone().unwrap())], BLOCK, &data, 1, u64::MAX).is_err());
         assert_eq!(contents(&file, 512), vec![0x55; 512]);
     }
 
@@ -810,7 +826,7 @@ mod tests {
         let mut p = part(vec![op(0, 0, 1, &data)], &data);
         p.new_partition_info.as_mut().unwrap().hash = Some(vec![0; 32]);
         let file = tempfile::tempfile().unwrap();
-        let err = write_targets(&[target(&p, file)], BLOCK, &data, 1, false, u64::MAX).unwrap_err();
+        let err = write_targets(&[target(&p, file)], BLOCK, &data, 1, u64::MAX).unwrap_err();
         assert!(format!("{err:#}").contains("SHA-256 mismatch"));
     }
 
@@ -833,10 +849,25 @@ mod tests {
                 p.new_partition_info.as_mut().unwrap().hash = Some(vec![0; 32]);
             }
             let file = tempfile::tempfile().unwrap();
-            let result = write_targets(&[target(&p, file.try_clone().unwrap())], BLOCK, &image, workers, false, 0);
+            let result = write_targets(&[target(&p, file.try_clone().unwrap())], BLOCK, &image, workers, 0);
             assert_eq!(result.is_ok(), hash_ok);
             assert_eq!(contents(&file, image.len()), image);
         }
+    }
+
+    #[test]
+    fn readback_is_per_partition_and_needs_a_real_block_device() {
+        // a regular file cannot drop a device cache, so asking for readback on
+        // one must fail loudly rather than quietly fall back to the cache
+        let data = vec![7u8; 512];
+        let p = part(vec![op(0, 0, 1, &data)], &data);
+        let file = tempfile::tempfile().unwrap();
+        let mut t = target(&p, file.try_clone().unwrap());
+        t.readback = true;
+        let err = write_targets(&[t], BLOCK, &data, 1, u64::MAX).unwrap_err();
+        assert!(format!("{err:#}").contains("device cache"));
+        // the same partition without the flag is fine
+        write_targets(&[target(&p, file)], BLOCK, &data, 1, u64::MAX).unwrap();
     }
 
     #[test]

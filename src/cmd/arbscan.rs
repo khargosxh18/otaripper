@@ -394,6 +394,7 @@ pub fn run(no_json: bool, path: &Path) -> anyhow::Result<()> {
                 no_open: true,
                 direct_fd: Vec::new(),
                 readback: false,
+                readback_for: Vec::new(),
                 positional_payload: Some(path.to_path_buf()),
                 quiet: true,
             };

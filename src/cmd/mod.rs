@@ -131,6 +131,16 @@ pub struct Cmd {
     )]
     pub(super) readback: bool,
 
+    /// With --direct-fd: verify only these partitions from the device
+    #[clap(
+        long,
+        value_delimiter = ',',
+        value_name = "PARTITIONS",
+        requires = "direct_fd",
+        help = "With --direct-fd: like --readback, but only for the listed partitions (e.g. firmware); the others are verified from the page cache as usual."
+    )]
+    pub(super) readback_for: Vec<String>,
+
     /// Positional argument for the payload file
     #[clap(value_hint = ValueHint::FilePath)]
     #[clap(index = 1, value_name = "PATH_OR_URL")]
