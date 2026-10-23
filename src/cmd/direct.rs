@@ -559,9 +559,9 @@ fn check_digest(t: &Target<'_>, got: digest::Digest) -> Result<()> {
     let expected = expected_hash(t)?;
     ensure!(
         got.as_ref() == expected,
-        "image SHA-256 mismatch: expected {}, got {}",
-        hex::encode(expected),
-        hex::encode(got.as_ref())
+        "image SHA-256 mismatch (expected {}, got {})",
+        &hex::encode(expected)[..12],
+        &hex::encode(got.as_ref())[..12]
     );
     Ok(())
 }
